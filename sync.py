@@ -24,10 +24,6 @@ STATUS_CONCLUIDO = {
     DB_ROTINAS_SP:  "Concluido",
 }
 
-TITLE_FIELD = {
-    DB_LISTA_GERAL: "Tarefa",
-    DB_ROTINAS_SP:  "ID",
-}
 
 
 def build_google_tasks_service():
@@ -45,6 +41,14 @@ def build_google_tasks_service():
         creds.refresh(Request())
         log.info("Token Google renovado.")
     return build("tasks", "v1", credentials=creds, cache_discovery=False)
+
+
+def get_title(page):
+    """Retorna o título da página buscando pela propriedade de tipo 'title'."""
+    for prop in page["properties"].values():
+        if prop.get("type") == "title":
+            return "".join(t.get("plain_text", "") for t in prop.get("title", []))
+    return ""
 
 
 def get_text(page, field):
@@ -77,7 +81,6 @@ def sync_notion_to_google(notion, svc):
     total = 0
     for db_id in [DB_LISTA_GERAL, DB_ROTINAS_SP]:
         status_concluido = STATUS_CONCLUIDO[db_id]
-        title_field      = TITLE_FIELD[db_id]
         resp = notion.databases.query(
             database_id=db_id,
             filter={"property": "Google ID", "rich_text": {"is_empty": True}}
@@ -86,7 +89,7 @@ def sync_notion_to_google(notion, svc):
             status = get_status(page)
             if status == status_concluido:
                 continue
-            title = get_text(page, title_field)
+            title = get_title(page)
             if not title:
                 continue
             date_str = get_date(page, "Prazo final") or get_date(page, "Data")
