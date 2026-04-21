@@ -173,6 +173,10 @@ def sync_notion_to_google(notion, svc):
                 body["due"] = to_google_due(date_str)
             try:
                 task = svc.tasks().insert(tasklist=TASKLIST_ID, body=body).execute()
+            except Exception as e:
+                log.error("  Erro criar Google '%s': %s", title, e)
+                continue
+            try:
                 notion.pages.update(
                     page_id=page["id"],
                     properties={
@@ -183,7 +187,11 @@ def sync_notion_to_google(notion, svc):
                 log.info("  Criado: '%s'", title)
                 created += 1
             except Exception as e:
-                log.error("  Erro criar '%s': %s", title, e)
+                log.error("  Google ID gravacao falhou '%s' (gid=%s): %s -- removendo task Google para evitar duplicata", title, task["id"], e)
+                try:
+                    svc.tasks().delete(tasklist=TASKLIST_ID, task=task["id"]).execute()
+                except Exception as de:
+                    log.error("  Rollback Google falhou (gid=%s): %s", task["id"], de)
 
         # 2. CANCEL: com Google ID e Status=Cancelada -> deleta do Google
         cancel_pages = query_all_pages(notion, db_id, {
@@ -223,32 +231,34 @@ def sync_notion_to_google(notion, svc):
                 continue
             gid   = get_google_id(page)
             title = get_title(page)
-            task  = fetch_google_task(svc, gid)
-            if task is None:
-                notion.pages.update(page_id=page["id"], properties={
-                    "Google ID": {"rich_text": []},
-                    "Status":    {"select": {"name": STATUS_CANCELADA}},
-                })
-                log.info("  Task deletada no Google, marcada Cancelada no Notion: '%s'", title)
+            if not gid:
                 continue
-            if task.get("status") == "completed":
-                continue
-            patch, changed = {}, False
-            if task.get("title") != title:
-                patch["title"] = title
-                changed = True
-            notion_date = get_date(page, "Prazo final") or get_date(page, "Data")
-            google_date = from_google_due(task.get("due"))
-            if notion_date != google_date:
-                patch["due"] = to_google_due(notion_date)
-                changed = True
-            if changed:
-                try:
+            try:
+                task = fetch_google_task(svc, gid)
+                if task is None:
+                    notion.pages.update(page_id=page["id"], properties={
+                        "Google ID": {"rich_text": []},
+                        "Status":    {"select": {"name": STATUS_CANCELADA}},
+                    })
+                    log.info("  Task deletada no Google, marcada Cancelada no Notion: '%s'", title)
+                    continue
+                if task.get("status") == "completed":
+                    continue
+                patch, changed = {}, False
+                if task.get("title") != title:
+                    patch["title"] = title
+                    changed = True
+                notion_date = get_date(page, "Prazo final") or get_date(page, "Data")
+                google_date = from_google_due(task.get("due"))
+                if notion_date != google_date:
+                    patch["due"] = to_google_due(notion_date)
+                    changed = True
+                if changed:
                     svc.tasks().patch(tasklist=TASKLIST_ID, task=gid, body=patch).execute()
                     log.info("  Atualizado no Google: '%s'", title)
                     updated += 1
-                except Exception as e:
-                    log.error("  Erro atualizar '%s': %s", title, e)
+            except Exception as e:
+                log.error("  Erro atualizar '%s': %s", title, e)
 
     log.info("  Criados: %d | Atualizados: %d | Cancelados: %d", created, updated, cancelled)
 
@@ -259,7 +269,7 @@ def sync_google_to_notion(notion, svc):
     completed_n = created_n = 0
 
     # 1. COMPLETE: concluidas no Google nos ultimos SYNC_WINDOW_MIN
-    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=SYNC_WINDOW_MIN)).isoformat()
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=SYNC_WINDOW_MIN)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     try:
         resp = svc.tasks().list(
             tasklist=TASKLIST_ID, showCompleted=True, showHidden=True,
