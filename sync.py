@@ -225,8 +225,11 @@ def sync_notion_to_google(notion, svc):
             title = get_title(page)
             task  = fetch_google_task(svc, gid)
             if task is None:
-                notion.pages.update(page_id=page["id"], properties={"Google ID": {"rich_text": []}})
-                log.info("  Task sumiu do Google, limpei Google ID: '%s'", title)
+                notion.pages.update(page_id=page["id"], properties={
+                    "Google ID": {"rich_text": []},
+                    "Status":    {"select": {"name": STATUS_CANCELADA}},
+                })
+                log.info("  Task deletada no Google, marcada Cancelada no Notion: '%s'", title)
                 continue
             if task.get("status") == "completed":
                 continue
