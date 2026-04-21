@@ -85,11 +85,14 @@ def sync_notion_to_google(notion, svc):
             database_id=db_id,
             filter={"property": "Google ID", "rich_text": {"is_empty": True}}
         )
-        for page in resp.get("results", []):
+        pages = resp.get("results", [])
+        log.info("  DB %s: %d paginas sem Google ID (has_more=%s)", db_id, len(pages), resp.get("has_more"))
+        for page in pages:
             status = get_status(page)
+            title = get_title(page)
+            log.info("    Pagina: '%s' | Status: %s | Google ID vazio: %s", title or "[sem titulo]", status, not get_text(page, "Google ID"))
             if status == status_concluido:
                 continue
-            title = get_title(page)
             if not title:
                 continue
             date_str = get_date(page, "Prazo final") or get_date(page, "Data")
