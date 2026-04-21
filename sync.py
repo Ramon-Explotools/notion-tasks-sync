@@ -81,39 +81,49 @@ def sync_notion_to_google(notion, svc):
     total = 0
     for db_id in [DB_LISTA_GERAL, DB_ROTINAS_SP]:
         status_concluido = STATUS_CONCLUIDO[db_id]
-        resp = notion.databases.query(
-            database_id=db_id,
-            filter={"property": "Google ID", "rich_text": {"is_empty": True}}
-        )
-        pages = resp.get("results", [])
-        log.info("  DB %s: %d paginas sem Google ID (has_more=%s)", db_id, len(pages), resp.get("has_more"))
-        for page in pages:
-            status = get_status(page)
-            title = get_title(page)
-            log.info("    Pagina: '%s' | Status: %s | Google ID vazio: %s", title or "[sem titulo]", status, not get_text(page, "Google ID"))
-            if status == status_concluido:
-                continue
-            if not title:
-                continue
-            date_str = get_date(page, "Prazo final") or get_date(page, "Data")
-            due = (date_str + "T00:00:00.000Z") if date_str else None
-            task_body = {"title": title, "notes": page_url(page)}
-            if due:
-                task_body["due"] = due
-            try:
-                created = svc.tasks().insert(tasklist=TASKLIST_ID, body=task_body).execute()
-                google_task_id = created["id"]
-                notion.pages.update(
-                    page_id=page["id"],
-                    properties={
-                        "Google ID": {"rich_text": [{"text": {"content": google_task_id}}]},
-                        "Fonte": {"select": {"name": "Notion"}}
-                    }
-                )
-                log.info("  Criado: %s (ID: %s)", title, google_task_id)
-                total += 1
-            except Exception as e:
-                log.error("  Erro ao criar task '%s': %s", title, e)
+        cursor = None
+        while True:
+            query_params = {
+                "database_id": db_id,
+                "filter": {
+                    "and": [
+                        {"property": "Google ID", "rich_text": {"is_empty": True}},
+                        {"property": "Status", "select": {"does_not_equal": status_concluido}},
+                    ]
+                },
+                "page_size": 100,
+            }
+            if cursor:
+                query_params["start_cursor"] = cursor
+            resp = notion.databases.query(**query_params)
+            pages = resp.get("results", [])
+            log.info("  DB %s: %d paginas ativas sem Google ID (has_more=%s)", db_id, len(pages), resp.get("has_more"))
+            for page in pages:
+                title = get_title(page)
+                if not title:
+                    continue
+                date_str = get_date(page, "Prazo final") or get_date(page, "Data")
+                due = (date_str + "T00:00:00.000Z") if date_str else None
+                task_body = {"title": title, "notes": page_url(page)}
+                if due:
+                    task_body["due"] = due
+                try:
+                    created = svc.tasks().insert(tasklist=TASKLIST_ID, body=task_body).execute()
+                    google_task_id = created["id"]
+                    notion.pages.update(
+                        page_id=page["id"],
+                        properties={
+                            "Google ID": {"rich_text": [{"text": {"content": google_task_id}}]},
+                            "Fonte": {"select": {"name": "Notion"}}
+                        }
+                    )
+                    log.info("  Criado: %s (ID: %s)", title, google_task_id)
+                    total += 1
+                except Exception as e:
+                    log.error("  Erro ao criar task '%s': %s", title, e)
+            if not resp.get("has_more"):
+                break
+            cursor = resp.get("next_cursor")
     log.info("  Total criado: %d task(s)", total)
 
 
