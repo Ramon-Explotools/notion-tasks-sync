@@ -23,7 +23,7 @@ TERMINAL_STATUSES = {
     DB_ROTINAS_SP:  {"Concluido", "Cancelada"},
 }
 
-UPDATE_WINDOW_MIN = 60
+UPDATE_WINDOW_MIN = 1440
 
 _title_key_cache = {}
 
@@ -110,7 +110,7 @@ def query_all_pages(notion, db_id, filter_obj):
     return pages
 
 
-def get_all_notion_google_ids(notion):
+def get_notion_pages_with_gid(notion):
     mapping = {}
     for db_id in [DB_LISTA_GERAL, DB_ROTINAS_SP]:
         for page in query_all_pages(notion, db_id, {
@@ -118,7 +118,7 @@ def get_all_notion_google_ids(notion):
         }):
             gid = get_google_id(page)
             if gid:
-                mapping[gid] = (page["id"], db_id)
+                mapping[gid] = (page, db_id)
     return mapping
 
 
@@ -264,56 +264,66 @@ def sync_notion_to_google(notion, svc):
 
 def sync_google_to_notion(notion, svc):
     log.info("=== Google Tasks -> Notion ===")
-    notion_ids = get_all_notion_google_ids(notion)
+    notion_pages = get_notion_pages_with_gid(notion)
     completed_n = created_n = updated_n = 0
 
-    # 1. Busca tasks atualizadas (concluidas ou nao) nos ultimos UPDATE_WINDOW_MIN
-    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=UPDATE_WINDOW_MIN)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    recent_tasks, page_token = [], None
+    # Busca todas as tasks ativas (base para reconciliacao completa)
+    try:
+        active_tasks = get_all_active_google_tasks(svc)
+    except Exception as e:
+        log.error("Erro listar tasks ativas: %s", e)
+        active_tasks = []
+
+    # Busca tasks completadas nas ultimas 48h (para detectar conclusoes)
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    completed_tasks, page_token = [], None
     while True:
         try:
             params = {
-                "tasklist": TASKLIST_ID,
-                "showCompleted": True, "showHidden": True,
-                "updatedMin": cutoff, "maxResults": 100,
+                "tasklist": TASKLIST_ID, "showCompleted": True, "showHidden": True,
+                "completedMin": cutoff, "maxResults": 100,
             }
             if page_token:
                 params["pageToken"] = page_token
             resp = svc.tasks().list(**params).execute()
-            recent_tasks.extend(resp.get("items", []))
+            completed_tasks.extend([t for t in resp.get("items", []) if t.get("status") == "completed"])
             page_token = resp.get("nextPageToken")
             if not page_token:
                 break
         except Exception as e:
-            log.error("Erro listar tasks recentes: %s", e)
+            log.error("Erro listar completadas: %s", e)
             break
 
-    log.info("  Tasks atualizadas nos ultimos %dmin: %d", UPDATE_WINDOW_MIN, len(recent_tasks))
+    log.info("  Ativas: %d | Completadas 48h: %d", len(active_tasks), len(completed_tasks))
 
-    # 2. Sincroniza status/title/date do Google para o Notion
-    for task in recent_tasks:
+    # 1. Marcar Concluido no Notion para tasks completadas no Google
+    for task in completed_tasks:
         gid = task["id"]
-        if gid not in notion_ids:
+        if gid not in notion_pages:
             continue
-        page_id, db_id = notion_ids[gid]
+        page, db_id = notion_pages[gid]
         title = task.get("title", "")
         try:
-            page = notion.pages.retrieve(page_id=page_id)
-            current_status = get_status(page)
+            if get_status(page) not in TERMINAL_STATUSES[db_id]:
+                notion.pages.update(
+                    page_id=page["id"],
+                    properties={"Status": {"select": {"name": STATUS_CONCLUIDO[db_id]}}}
+                )
+                log.info("  Concluido no Notion: '%s'", title)
+                completed_n += 1
+        except Exception as e:
+            log.error("  Erro concluir '%s': %s", title, e)
 
-            if task.get("status") == "completed":
-                if current_status not in TERMINAL_STATUSES[db_id]:
-                    notion.pages.update(
-                        page_id=page_id,
-                        properties={"Status": {"select": {"name": STATUS_CONCLUIDO[db_id]}}}
-                    )
-                    log.info("  Concluido no Notion: '%s'", title)
-                    completed_n += 1
-                continue
-
-            if current_status in TERMINAL_STATUSES[db_id]:
-                continue
-
+    # 2. Reconciliacao completa: compara cada task ativa com a pagina Notion correspondente
+    for task in active_tasks:
+        gid = task["id"]
+        if gid not in notion_pages:
+            continue
+        page, db_id = notion_pages[gid]
+        title = task.get("title", "")
+        if get_status(page) in TERMINAL_STATUSES[db_id]:
+            continue
+        try:
             patch_props = {}
             notion_title = get_title(page)
             google_title = (task.get("title") or "").strip()
@@ -328,22 +338,15 @@ def sync_google_to_notion(notion, svc):
                 patch_props[date_field] = {"date": {"start": google_date}} if google_date else {"date": None}
 
             if patch_props:
-                notion.pages.update(page_id=page_id, properties=patch_props)
+                notion.pages.update(page_id=page["id"], properties=patch_props)
                 log.info("  Notion sincronizado de Google: '%s'", title)
                 updated_n += 1
         except Exception as e:
-            log.error("  Erro sync Google->Notion '%s': %s", title, e)
+            log.error("  Erro sync '%s': %s", title, e)
 
-    # 3. CREATE: tasks do Google sem pagina no Notion
-    try:
-        active_tasks = get_all_active_google_tasks(svc)
-    except Exception as e:
-        log.error("Erro listar tasks ativas: %s", e)
-        active_tasks = []
-
-    new_tasks = [t for t in active_tasks if t["id"] not in notion_ids]
+    # 3. CREATE: tasks ativas sem pagina no Notion
+    new_tasks = [t for t in active_tasks if t["id"] not in notion_pages]
     log.info("  Tasks Google sem Notion: %d", len(new_tasks))
-
     title_key = get_title_key(notion, DB_LISTA_GERAL)
     for task in new_tasks:
         title = (task.get("title") or "").strip()
@@ -363,7 +366,7 @@ def sync_google_to_notion(notion, svc):
             log.info("  Criado no Notion: '%s'", title)
             created_n += 1
         except Exception as e:
-            log.error("  Erro criar no Notion '%s': %s", title, e)
+            log.error("  Erro criar '%s': %s", title, e)
 
     log.info("  Concluidos: %d | Sincronizados: %d | Criados: %d", completed_n, updated_n, created_n)
 
