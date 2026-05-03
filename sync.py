@@ -6,6 +6,7 @@ from datetime import datetime, timezone, timedelta
 from notion_client import Client as NotionClient
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 
@@ -39,9 +40,20 @@ def build_google_tasks_service():
         scopes=creds_data.get("scopes", ["https://www.googleapis.com/auth/tasks"]),
     )
     if creds.expired or not creds.valid:
-        creds.refresh(Request())
+        try:
+            creds.refresh(Request())
+        except RefreshError as exc:
+            raise RuntimeError(
+                "Google OAuth invalido: gere um novo google_token.json e atualize "
+                "o secret GOOGLE_CREDENTIALS_JSON no GitHub."
+            ) from exc
         log.info("Token Google renovado.")
     return build("tasks", "v1", credentials=creds, cache_discovery=False)
+
+
+def is_google_auth_error(exc):
+    text = str(exc).lower()
+    return "invalid_grant" in text or "expired or revoked" in text
 
 
 def get_title(page):
@@ -173,6 +185,11 @@ def sync_notion_to_google(notion, svc):
             try:
                 task = svc.tasks().insert(tasklist=TASKLIST_ID, body=body).execute()
             except Exception as e:
+                if is_google_auth_error(e):
+                    raise RuntimeError(
+                        "Google OAuth invalido durante criacao de task. Atualize "
+                        "GOOGLE_CREDENTIALS_JSON no GitHub."
+                    ) from e
                 log.error("  Erro criar Google '%s': %s", title, e)
                 continue
             try:
@@ -210,6 +227,11 @@ def sync_notion_to_google(notion, svc):
                 log.info("  Cancelada, removida do Google: '%s'", title)
                 cancelled += 1
             except Exception as e:
+                if is_google_auth_error(e):
+                    raise RuntimeError(
+                        "Google OAuth invalido durante cancelamento. Atualize "
+                        "GOOGLE_CREDENTIALS_JSON no GitHub."
+                    ) from e
                 log.error("  Erro cancelar '%s': %s", title, e)
 
         # 3. UPDATE: editadas no Notion nos ultimos UPDATE_WINDOW_MIN
@@ -257,6 +279,11 @@ def sync_notion_to_google(notion, svc):
                     log.info("  Atualizado no Google: '%s'", title)
                     updated += 1
             except Exception as e:
+                if is_google_auth_error(e):
+                    raise RuntimeError(
+                        "Google OAuth invalido durante atualizacao. Atualize "
+                        "GOOGLE_CREDENTIALS_JSON no GitHub."
+                    ) from e
                 log.error("  Erro atualizar '%s': %s", title, e)
 
     log.info("  Criados: %d | Atualizados: %d | Cancelados: %d", created, updated, cancelled)
@@ -267,10 +294,45 @@ def sync_google_to_notion(notion, svc):
     notion_pages = get_notion_pages_with_gid(notion)
     completed_n = created_n = updated_n = 0
 
+    # Reconciliacao confiavel: para cada pagina Notion ainda aberta e ja
+    # ligada a uma task Google, consulta a task diretamente pelo Google ID.
+    # Isso corrige conclusoes antigas que foram perdidas por janela de cron.
+    checked_n = 0
+    for gid, (page, db_id) in notion_pages.items():
+        if get_status(page) in TERMINAL_STATUSES[db_id]:
+            continue
+        try:
+            task = fetch_google_task(svc, gid)
+        except Exception as e:
+            if is_google_auth_error(e):
+                raise RuntimeError(
+                    "Google OAuth invalido durante reconciliacao. Atualize "
+                    "GOOGLE_CREDENTIALS_JSON no GitHub."
+                ) from e
+            log.error("  Erro buscar task Google gid=%s: %s", gid, e)
+            continue
+        checked_n += 1
+        if task and task.get("status") == "completed":
+            title = task.get("title", get_title(page))
+            try:
+                notion.pages.update(
+                    page_id=page["id"],
+                    properties={"Status": {"select": {"name": STATUS_CONCLUIDO[db_id]}}}
+                )
+                log.info("  Concluido no Notion por reconciliacao: '%s'", title)
+                completed_n += 1
+            except Exception as e:
+                log.error("  Erro concluir '%s': %s", title, e)
+
     # Busca todas as tasks ativas (base para reconciliacao completa)
     try:
         active_tasks = get_all_active_google_tasks(svc)
     except Exception as e:
+        if is_google_auth_error(e):
+            raise RuntimeError(
+                "Google OAuth invalido ao listar tasks ativas. Atualize "
+                "GOOGLE_CREDENTIALS_JSON no GitHub."
+            ) from e
         log.error("Erro listar tasks ativas: %s", e)
         active_tasks = []
 
@@ -291,10 +353,15 @@ def sync_google_to_notion(notion, svc):
             if not page_token:
                 break
         except Exception as e:
+            if is_google_auth_error(e):
+                raise RuntimeError(
+                    "Google OAuth invalido ao listar tasks completadas. Atualize "
+                    "GOOGLE_CREDENTIALS_JSON no GitHub."
+                ) from e
             log.error("Erro listar completadas: %s", e)
             break
 
-    log.info("  Ativas: %d | Completadas 48h: %d", len(active_tasks), len(completed_tasks))
+    log.info("  Conferidas por Google ID: %d | Ativas: %d | Completadas 48h: %d", checked_n, len(active_tasks), len(completed_tasks))
 
     # 1. Marcar Concluido no Notion para tasks completadas no Google
     for task in completed_tasks:
